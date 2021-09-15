@@ -3,6 +3,7 @@
 
 from dialog_machine.interfaces import *
 from dialog_machine.project_exceptions import *
+from contextlib import closing
 from copy import deepcopy
 import logging
 
@@ -862,7 +863,10 @@ class MsgGetterRedis(MsgGetter):
 
                 msg_list.append(dict(dict_id=dict_id, msg_id=msg_id,
                                      msg_obj=msg_obj_b, msg_dict=msg_dict_b, alias_msg=alias_msg))
-                self._redis.delete(alias_msg)
+                try:
+                    self._redis.delete(alias_msg)
+                except:
+                    pass
         if common_dict_b is None:
             common_dict_b = pickle.dumps(dict())
         self._redis.hdel(item_id, 'common_dict')
@@ -1353,7 +1357,10 @@ class ContextStorageRedis(ContextStorage):
 
         if lock.acquire(blocking=True):
             temp = self._redis.hget(item_id, "context")
-            context = pickle.loads(temp) if temp is not None else ContextItem()
+            if temp is not None:
+                context = pickle.loads(temp)
+            else:
+                context = ContextItem()
             context = self._get_remote_instructions(context, str(remote_instructions_name))
             context_b = pickle.dumps(context)
 
@@ -1362,8 +1369,11 @@ class ContextStorageRedis(ContextStorage):
                 self._redis.delete(remote_instructions_name)
             except:
                 pass
-            if int(self._redis.hlen(item_id)) == 0:
-                self._redis.delete(item_id)
+            if len(self._redis.hkeys(item_id)) <= 2:
+                if int(self._redis.hlen(item_id)) == 0:
+                    self._redis.delete(item_id)
+            else:
+                self._redis.hset(item_id, "context", context_b)
             unlock(lock)
             return context_b
 
@@ -1427,15 +1437,16 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
     def create_tabs(self):
         """ Создание необходимых таблиц """
         # try:
-        with self._get_db_connect() as conn:
-            cur = conn.cursor()
-            request = """CREATE TABLE if not exists tab(
-                                dict_id_uuid uuid PRIMARY KEY,
-                                data bytea NOT NULL,
-                                aliases_array uuid[],
-                                time_of_backup NUMERIC(16, 5) DEFAULT date_part('epoch', now())
-                            );"""
-            cur.execute(request)
+        with closing(self._get_db_connect()) as conn:
+            with conn.cursor() as cur:
+                request = """CREATE TABLE if not exists tab(
+                                    dict_id_uuid uuid PRIMARY KEY,
+                                    data bytea NOT NULL,
+                                    aliases_array uuid[],
+                                    time_of_backup NUMERIC(16, 5) DEFAULT date_part('epoch', now())
+                                );"""
+                cur.execute(request)
+                conn.commit()
         # except Exception as e:
         #     logging.error('Problem with DB: %s' % str(e))
         #     raise ContextError('Problem with DB')
@@ -1447,18 +1458,19 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
 
     def get_data_by_alias(self, alias_msg):
         try:
-            with self._get_db_connect() as conn:
-                cur = conn.cursor()
-                request = """SELECT data FROM tab WHERE (%s)::uuid=ANY(aliases_array);"""
-                cur.execute(request, (alias_msg,))
-                try:
-                    res = cur.fetchone()
-                    if res is not None:
-                        return pickle.loads(res[0])
-                    else:
-                        return None
-                except:
-                    return None
+            with closing(self._get_db_connect()) as conn:
+                with conn.cursor() as cur:
+                    request = """SELECT data FROM tab WHERE (%s)::uuid=ANY(aliases_array);"""
+                    cur.execute(request, (alias_msg,))
+                    result = None
+                    try:
+                        res = cur.fetchone()
+                        if res is not None:
+                            result = pickle.loads(res[0])
+                    except:
+                        pass
+                    conn.commit()
+                return result
         except Exception as e:
             return None
 
@@ -1469,18 +1481,19 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
         :return:
         """
         try:
-            with self._get_db_connect() as conn:
-                cur = conn.cursor()
-                request = """SELECT data FROM tab WHERE dict_id_uuid=md5(%s)::uuid;"""
-                cur.execute(request, (get_str(dict_id),))
-                try:
-                    res = cur.fetchone()
-                    if res is not None:
-                        return pickle.loads(res[0])
-                    else:
-                        return None
-                except:
-                    return None
+            with closing(self._get_db_connect()) as conn:
+                result = None
+                with conn.cursor() as cur:
+                    request = """SELECT data FROM tab WHERE dict_id_uuid=md5(%s)::uuid;"""
+                    cur.execute(request, (get_str(dict_id),))
+                    try:
+                        res = cur.fetchone()
+                        if res is not None:
+                            result = pickle.loads(res[0])
+                    except:
+                        pass
+                    conn.commit()
+                return result
         except Exception as e:
             return None
 
@@ -1492,20 +1505,25 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
         :return:
         """
         try:
-            with self._get_db_connect() as conn:
-                cur = conn.cursor()
-                request = """INSERT INTO tab (dict_id_uuid, data, aliases_array) 
-                                VALUES (md5(%(dict_id_str)s)::uuid, %(data)s, %(aliases_array)s::uuid[])
-                                ON CONFLICT (dict_id_uuid) DO UPDATE SET data=%(data)s, 
-                                            time_of_backup=DEFAULT, 
-                                            aliases_array=(%(aliases_array)s::uuid[]);"""
-                cur.execute(request,
-                            dict(dict_id_str=get_str(dict_id),
-                                 data=pickle.dumps(value),
-                                 aliases_array=[v['alias_msg'] for v in value['msg_list']])
-                            )
+            with closing(self._get_db_connect()) as conn:
+                with conn.cursor() as cur:
+                    request = """INSERT INTO tab (dict_id_uuid, data, aliases_array) 
+                                    VALUES (md5(%(dict_id_str)s)::uuid, %(data)s, %(aliases_array)s::uuid[])
+                                    ON CONFLICT (dict_id_uuid) DO UPDATE SET data=%(data)s, 
+                                                time_of_backup=DEFAULT, 
+                                                aliases_array=(%(aliases_array)s::uuid[]);"""
+                    cur.execute(request,
+                                dict(dict_id_str=get_str(dict_id),
+                                     data=pickle.dumps(value),
+                                     aliases_array=[v['alias_msg'] for v in value['msg_list']])
+                                )
+                    conn.commit()
         except Exception as e:
-            logging.warning('Ошибка переноса из redis в базу: ', e)
+            logging.warning(f'Ошибка переноса из redis в базу: {e}')
+            # try:
+            #     conn.close()
+            # except:
+            #     pass
             return False
         return True
 
@@ -1530,13 +1548,14 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
                                                    thread_local=False)
                 if my_lock_dict_id.acquire(blocking=True):
                     try:
-                        data = self._getter.get_data(dict_id)
+                        context_res = self._context_storage.get_data(dict_id)
                     except IsMsgProcessError as e:
                         logging.info('Lock by dict_id={} is busy'.format(dict_id))
                         continue
                     else:
                         try:
-                            data['context'] = self._context_storage.get_data(dict_id)
+                            data = self._getter.get_data(dict_id)
+                            data['context'] = context_res
                             data['dict_id'] = dict_id
 
                             token = get_hash(dict_id)
@@ -1546,6 +1565,7 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
                                 # Удаляем заархивированный элемент
                                 self._redis.zrem(self._SORTED_SET_NAME, v)
                         except Exception as e:
+                            logging.info(f'get_data dict_id={dict_id}, error={e}')
                             pass
                     finally:
                         my_lock_dict_id.release()
@@ -1561,10 +1581,7 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
             dict_id = arg_dict.get('dict_id', None)
             alias_msg = arg_dict.get('alias_msg', None)
 
-            # print(f' --- Test wrapper func={func.__name__}')
-
             if alias_msg is not None and not self._getter.exists_alias_msg(alias_msg):
-                # print(f' --- --- alias_msg={alias_msg}')
                 my_lock_alias_msg = self._redis.lock(f'{alias_msg}_{self._LOCK_PG}',
                                                      timeout=self._timeout_,
                                                      blocking_timeout=self._blocking_timeout,
@@ -1573,17 +1590,14 @@ class GetterReplicatorPostgreSQL(MsgGetter, ContextStorage):
                     try:
                         data = self.get_data_by_alias(alias_msg)
                         if data is not None:
-                            # print('Пришли сюда 1')
                             dict_id_a = data['dict_id']
                             my_lock_dict_id = self._redis.lock(self.get_lock_name(dict_id_a, self._LOCK_PG),
                                                                timeout=self._timeout_,
                                                                blocking_timeout=self._blocking_timeout,
                                                                thread_local=False)
                             if my_lock_dict_id.acquire(blocking=True):
-                                # print('Пришли сюда 2')
                                 try:
                                     if not self._getter.exists_dict_id(dict_id_a):
-                                        # print(f'Пришли сюда 3 item_id={str(get_hash(dict_id_a)).encode()}')
                                         self._getter.put_data(dict_id=dict_id_a, value=data)
                                         # Если dict_id_a!=dict_id то исходя из логики работы
                                         # self._context_storage для dict_id_a скорее всего не понадобится,

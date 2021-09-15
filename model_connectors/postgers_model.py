@@ -50,21 +50,27 @@ class ModelConnectorPostgre(ModelConnectorBase):
             master_arg - запрос к базе
             arg - список либо словарь аргументов запроса, в зависимости от самого запроса)
             """
-        cur = conn.cursor()
         request = master_arg
         if request is None:
             raise DialogMachineModelError('request is None')
-        if (isinstance(arg, dict) or isinstance(arg, list)) and len(arg) > 0:
-            cur.execute(request, arg)
-        else:
-            cur.execute(request)
-
+        cur = conn.cursor()
         try:
-            t = cur.fetchall()
-        except psycopg2.ProgrammingError as e:
-            return list()
-        else:
-            return modify_res(t, cur)
+            if (isinstance(arg, dict) or isinstance(arg, list)) and len(arg) > 0:
+                cur.execute(request, arg)
+            else:
+                cur.execute(request)
+
+            try:
+                t = cur.fetchall()
+            except psycopg2.ProgrammingError as e:
+                result = list()
+            else:
+                result = modify_res(t, cur)
+        except Exception as e:
+            raise DialogMachineModelError(f'Cursor error e={e}')
+        finally:
+            cur.close()
+        return result
 
     def rollback_model(self, conn, init_dict, arg):
         """ Выполняет запрос к базе (функционал метода из model_master, так сделано для
